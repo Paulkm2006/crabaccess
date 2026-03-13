@@ -20,9 +20,10 @@ pub(super) fn render_dimension(
         .constraints([Constraint::Length(12), Constraint::Min(8)])
         .split(area);
 
+    let (bar_count, bar_width) = chart_geometry(sub[0], rows.len(), app.graph_items);
     let bars: Vec<Bar<'static>> = rows
         .iter()
-        .take(app.graph_items)
+        .take(bar_count)
         .map(|row| {
             let value = match app.sort_by {
                 SortBy::Visits => row.visits,
@@ -36,13 +37,14 @@ pub(super) fn render_dimension(
     let bar_chart = BarChart::new(bars)
         .block(
             Block::default().borders(Borders::ALL).title(format!(
-                "Top {} {} by {:?}",
-                app.graph_items,
+                "Top {} of {} {} by {:?}",
+                bar_count,
+                rows.len(),
                 dimension.title(),
                 app.sort_by
             )),
         )
-        .bar_width(9)
+        .bar_width(bar_width)
         .bar_gap(1)
         .value_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
         .label_style(Style::default().fg(Color::White))
@@ -92,6 +94,37 @@ pub(super) fn render_dimension(
     frame.render_widget(table, sub[1]);
 }
 
+fn chart_geometry(chart_area: Rect, rows_len: usize, graph_items_cap: usize) -> (usize, u16) {
+    const MIN_BAR_WIDTH: usize = 3;
+    const PREFERRED_BAR_WIDTH: usize = 9;
+    const BAR_GAP: usize = 1;
+
+    if rows_len == 0 {
+        return (0, PREFERRED_BAR_WIDTH as u16);
+    }
+
+    let inner_width = chart_area.width.saturating_sub(2) as usize;
+    if inner_width == 0 {
+        return (1, MIN_BAR_WIDTH as u16);
+    }
+
+    let width_limited = ((inner_width + BAR_GAP) / (MIN_BAR_WIDTH + BAR_GAP)).max(1);
+    let cap_limited = if graph_items_cap == 0 {
+        width_limited
+    } else {
+        width_limited.min(graph_items_cap)
+    };
+    let bar_count = rows_len.min(cap_limited).max(1);
+
+    let gaps_width = BAR_GAP * bar_count.saturating_sub(1);
+    let bars_width = inner_width.saturating_sub(gaps_width);
+    let bar_width = (bars_width / bar_count)
+        .clamp(MIN_BAR_WIDTH, PREFERRED_BAR_WIDTH)
+        as u16;
+
+    (bar_count, bar_width)
+}
+
 fn truncate_label(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         text.to_owned()
@@ -133,5 +166,23 @@ mod tests {
     fn chart_value_text_uses_human_readable_bytes_for_traffic_sort() {
         let row = metric_row(42, 3_145_728);
         assert_eq!(chart_value_text(SortBy::Traffic, &row), "3.00 MB");
+    }
+
+    #[test]
+    fn chart_geometry_uses_available_width_for_capacity() {
+        let area = Rect::new(0, 0, 80, 12);
+        let (bar_count, bar_width) = chart_geometry(area, 100, 0);
+
+        assert_eq!(bar_count, 19);
+        assert_eq!(bar_width, 3);
+    }
+
+    #[test]
+    fn chart_geometry_honors_graph_items_cap_when_set() {
+        let area = Rect::new(0, 0, 120, 12);
+        let (bar_count, bar_width) = chart_geometry(area, 100, 7);
+
+        assert_eq!(bar_count, 7);
+        assert!(bar_width >= 3);
     }
 }

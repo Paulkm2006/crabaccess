@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::{Args, SortBy};
 
@@ -69,7 +70,7 @@ impl DateGranularity {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct Counter {
     pub visits: u64,
     pub traffic_bytes: u64,
@@ -87,7 +88,7 @@ impl Counter {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct Aggregates {
     pub total_visits: u64,
     pub total_traffic_bytes: u64,
@@ -251,6 +252,24 @@ impl GroupingRules {
                 regex: Regex::new(&args.group_ua_regex)
                     .with_context(|| "Invalid --group-ua-regex")?,
                 replace: args.group_ua_replace.clone(),
+            },
+        })
+    }
+
+    pub fn passthrough() -> Result<Self> {
+        let regex = Regex::new("^(.*)$").with_context(|| "Invalid passthrough regex")?;
+        Ok(Self {
+            ip: GroupRule {
+                regex: regex.clone(),
+                replace: "$1".to_owned(),
+            },
+            path: GroupRule {
+                regex: regex.clone(),
+                replace: "$1".to_owned(),
+            },
+            user_agent: GroupRule {
+                regex,
+                replace: "$1".to_owned(),
             },
         })
     }

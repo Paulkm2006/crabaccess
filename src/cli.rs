@@ -17,13 +17,22 @@ pub enum SortBy {
     about = "Parse nginx access logs in parallel and visualize metrics in a TUI"
 )]
 pub struct Args {
-    #[arg(required = true, value_name = "LOG_FILE")]
+    #[arg(value_name = "LOG_FILE", required_unless_present = "load_db")]
     pub files: Vec<PathBuf>,
+
+    #[arg(long, value_name = "FILE", conflicts_with = "files")]
+    pub load_db: Option<PathBuf>,
+
+    #[arg(long, value_name = "FILE")]
+    pub save_db: Option<PathBuf>,
+
+    #[arg(long, value_name = "FILE")]
+    pub export_csv: Option<PathBuf>,
 
     #[arg(long, default_value_t = 30)]
     pub top: usize,
 
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 0)]
     pub graph_items: usize,
 
     #[arg(long, value_enum, default_value_t = SortBy::Visits)]
@@ -127,8 +136,11 @@ mod tests {
 
         let args = Args {
             files: vec![dir.clone()],
+            load_db: None,
+            save_db: None,
+            export_csv: None,
             top: 30,
-            graph_items: 10,
+            graph_items: 0,
             sort_by: SortBy::Visits,
             group_ip_regex: "^(.*)$".to_owned(),
             group_ip_replace: "$1".to_owned(),
@@ -155,8 +167,11 @@ mod tests {
 
         let args = Args {
             files: vec![dir.clone()],
+            load_db: None,
+            save_db: None,
+            export_csv: None,
             top: 30,
-            graph_items: 10,
+            graph_items: 0,
             sort_by: SortBy::Visits,
             group_ip_regex: "^(.*)$".to_owned(),
             group_ip_replace: "$1".to_owned(),
