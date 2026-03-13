@@ -212,18 +212,34 @@ pub struct ParsedRecord {
 
 #[derive(Clone)]
 pub struct GroupRule {
-    regex: Regex,
-    replace: String,
+    kind: GroupRuleKind,
+}
+
+#[derive(Clone)]
+enum GroupRuleKind {
+    Passthrough,
+    Regex { regex: Regex, replace: String },
 }
 
 impl GroupRule {
+    fn from_parts(regex: Regex, replace: String) -> Self {
+        if regex.as_str() == "^(.*)$" && replace == "$1" {
+            return Self {
+                kind: GroupRuleKind::Passthrough,
+            };
+        }
+
+        Self {
+            kind: GroupRuleKind::Regex { regex, replace },
+        }
+    }
+
     pub fn apply(&self, input: &str) -> String {
-        if self.regex.is_match(input) {
-            self.regex
-                .replace_all(input, self.replace.as_str())
-                .to_string()
-        } else {
-            input.to_owned()
+        match &self.kind {
+            GroupRuleKind::Passthrough => input.to_owned(),
+            GroupRuleKind::Regex { regex, replace } => {
+                regex.replace_all(input, replace.as_str()).to_string()
+            }
         }
     }
 }
@@ -238,39 +254,28 @@ pub struct GroupingRules {
 impl GroupingRules {
     pub fn from_args(args: &Args) -> Result<Self> {
         Ok(Self {
-            ip: GroupRule {
-                regex: Regex::new(&args.group_ip_regex)
-                    .with_context(|| "Invalid --group-ip-regex")?,
-                replace: args.group_ip_replace.clone(),
-            },
-            path: GroupRule {
-                regex: Regex::new(&args.group_path_regex)
+            ip: GroupRule::from_parts(
+                Regex::new(&args.group_ip_regex).with_context(|| "Invalid --group-ip-regex")?,
+                args.group_ip_replace.clone(),
+            ),
+            path: GroupRule::from_parts(
+                Regex::new(&args.group_path_regex)
                     .with_context(|| "Invalid --group-path-regex")?,
-                replace: args.group_path_replace.clone(),
-            },
-            user_agent: GroupRule {
-                regex: Regex::new(&args.group_ua_regex)
-                    .with_context(|| "Invalid --group-ua-regex")?,
-                replace: args.group_ua_replace.clone(),
-            },
+                args.group_path_replace.clone(),
+            ),
+            user_agent: GroupRule::from_parts(
+                Regex::new(&args.group_ua_regex).with_context(|| "Invalid --group-ua-regex")?,
+                args.group_ua_replace.clone(),
+            ),
         })
     }
 
     pub fn passthrough() -> Result<Self> {
         let regex = Regex::new("^(.*)$").with_context(|| "Invalid passthrough regex")?;
         Ok(Self {
-            ip: GroupRule {
-                regex: regex.clone(),
-                replace: "$1".to_owned(),
-            },
-            path: GroupRule {
-                regex: regex.clone(),
-                replace: "$1".to_owned(),
-            },
-            user_agent: GroupRule {
-                regex,
-                replace: "$1".to_owned(),
-            },
+            ip: GroupRule::from_parts(regex.clone(), "$1".to_owned()),
+            path: GroupRule::from_parts(regex.clone(), "$1".to_owned()),
+            user_agent: GroupRule::from_parts(regex, "$1".to_owned()),
         })
     }
 }
@@ -310,10 +315,10 @@ mod tests {
 
     #[test]
     fn regex_grouping_can_extract_first_path_segment() {
-        let rule = GroupRule {
-            regex: Regex::new(r"^(/[^/?]+).*$").expect("rule regex should compile"),
-            replace: "$1".to_owned(),
-        };
+        let rule = GroupRule::from_parts(
+            Regex::new(r"^(/[^/?]+).*$").expect("rule regex should compile"),
+            "$1".to_owned(),
+        );
         let grouped = rule.apply("/products/list?page=2");
         assert_eq!(grouped, "/products");
     }

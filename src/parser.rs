@@ -12,7 +12,7 @@ use crate::domain::{Aggregates, GroupingRules, ParsedRecord};
 
 pub fn build_line_regex() -> Result<Regex> {
     Regex::new(
-        r#"^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+\"(?P<request>[^\"]*)\"\s+(?P<status>\d{3})\s+(?P<bytes>\S+)\s+\"[^\"]*\"\s+\"(?P<ua>[^\"]*)\""#,
+        r#"^(\S+)\s+\S+\s+\S+\s+\[([^\]]+)\]\s+\"([^\"]*)\"\s+(\d{3})\s+(\S+)\s+\"[^\"]*\"\s+\"([^\"]*)\""#,
     )
     .context("Failed to compile nginx access log regex")
 }
@@ -20,21 +20,14 @@ pub fn build_line_regex() -> Result<Regex> {
 pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
     let captures = line_regex.captures(line)?;
 
-    let ip = captures.name("ip")?.as_str().to_owned();
-    let request = captures.name("request")?.as_str();
-    let user_agent = captures
-        .name("ua")
-        .map_or("-", |m| m.as_str())
-        .to_owned();
-    let status_code = captures
-        .name("status")
-        .map_or("-", |m| m.as_str())
-        .to_owned();
+    let ip = captures.get(1)?.as_str().to_owned();
+    let timestamp_str = captures.get(2).map(|m| m.as_str().to_owned());
+    let request = captures.get(3)?.as_str();
+    let status_code = captures.get(4).map_or("-", |m| m.as_str()).to_owned();
     let traffic_bytes = captures
-        .name("bytes")
+        .get(5)
         .map_or(0, |m| m.as_str().parse::<u64>().unwrap_or(0));
-
-    let timestamp_str = captures.name("time").map(|m| m.as_str().to_owned());
+    let user_agent = captures.get(6).map_or("-", |m| m.as_str()).to_owned();
 
     let path = request
         .split_whitespace()
@@ -52,6 +45,7 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
 }
 
 const CHUNK_LINES: usize = 20_000;
+const READ_BUFFER_CAPACITY: usize = 1024 * 1024;
 
 fn parse_chunk(lines: &[String], line_regex: &Regex, rules: &GroupingRules) -> Aggregates {
     let mut aggregates = Aggregates::default();
@@ -74,41 +68,35 @@ fn parse_file(
 ) -> Result<Aggregates> {
     let file = File::open(path)
         .with_context(|| format!("Unable to open log file: {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut lines = Vec::new();
+    let reader = BufReader::with_capacity(READ_BUFFER_CAPACITY, file);
+
+    let mut chunk = Vec::with_capacity(CHUNK_LINES);
+    let mut aggregate = Aggregates::default();
 
     for line_result in reader.lines() {
         let line = line_result
             .with_context(|| format!("Unable to read a line from: {}", path.display()))?;
-        lines.push(line);
+        chunk.push(line);
+
+        if chunk.len() == CHUNK_LINES {
+            let chunk_agg = parse_chunk(&chunk, line_regex, rules);
+            aggregate.merge(chunk_agg);
+            if let Some(status_pb) = status_pb {
+                status_pb.inc(chunk.len() as u64);
+            }
+            chunk.clear();
+        }
     }
 
-    if let Some(status_pb) = status_pb {
-        status_pb.inc(lines.len() as u64);
+    if !chunk.is_empty() {
+        let chunk_agg = parse_chunk(&chunk, line_regex, rules);
+        aggregate.merge(chunk_agg);
+        if let Some(status_pb) = status_pb {
+            status_pb.inc(chunk.len() as u64);
+        }
     }
 
-    let aggregates = lines
-        .par_chunks(CHUNK_LINES)
-        .map(|chunk| parse_chunk(chunk, line_regex, rules))
-        .reduce(Aggregates::default, |mut acc, chunk_agg| {
-            acc.merge(chunk_agg);
-            acc
-        });
-
-    Ok(aggregates)
-}
-
-pub fn count_file_lines(path: &Path) -> Result<u64> {
-    let file = File::open(path)
-        .with_context(|| format!("Unable to open log file for line counting: {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut count = 0u64;
-    for line_result in reader.lines() {
-        line_result
-            .with_context(|| format!("Unable to read a line from: {}", path.display()))?;
-        count = count.saturating_add(1);
-    }
-    Ok(count)
+    Ok(aggregate)
 }
 
 pub fn parse_files_parallel(
@@ -118,15 +106,8 @@ pub fn parse_files_parallel(
     files_pb: &ProgressBar,
     status_pb: Option<&ProgressBar>,
 ) -> Result<Aggregates> {
-    // Pre-count lines across all files so both bars are fully initialised before parsing starts.
     if let Some(pb) = status_pb {
-        pb.set_message("counting lines…");
-        let total: u64 = files
-            .par_iter()
-            .map(|f| count_file_lines(f.as_path()).unwrap_or(0))
-            .sum();
-        pb.set_length(total);
-        pb.set_message("processing in parallel");
+        pb.set_message("processing lines");
     }
 
     let partials: Vec<Result<Aggregates>> = files

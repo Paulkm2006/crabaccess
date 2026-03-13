@@ -27,11 +27,12 @@ pub fn run(args: Args) -> Result<()> {
         let status_pb = multi.add(ProgressBar::new(0));
         status_pb.set_style(
             ProgressStyle::with_template(
-                "[{elapsed_precise}] [{bar:40.green/black}] {pos}/{len} lines  {msg}",
+                "[{elapsed_precise}] {spinner:.green} {pos} lines  {msg}",
             )
             .unwrap()
-            .progress_chars("=>-"),
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
         );
+        status_pb.enable_steady_tick(std::time::Duration::from_millis(120));
 
         let files_pb = multi.add(ProgressBar::new(files.len() as u64));
         files_pb.set_style(
