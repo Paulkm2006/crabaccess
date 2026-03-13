@@ -46,18 +46,35 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
 }
 
 const CHUNK_LINES: usize = 20_000;
+const PARALLEL_CHUNK_MIN_LINES: usize = 4_096;
 
 fn parse_chunk(lines: &[&str], line_regex: &Regex, rules: &GroupingRules) -> Aggregates {
-    let mut aggregates = Aggregates::default();
+    if lines.len() < PARALLEL_CHUNK_MIN_LINES {
+        let mut aggregates = Aggregates::default();
 
-    for line in lines {
-        match parse_line(line, line_regex) {
-            Some(record) => aggregates.record(record, rules),
-            None => aggregates.parse_errors += 1,
+        for line in lines {
+            match parse_line(line, line_regex) {
+                Some(record) => aggregates.record(record, rules),
+                None => aggregates.parse_errors += 1,
+            }
         }
+
+        return aggregates;
     }
 
-    aggregates
+    lines
+        .par_iter()
+        .fold(Aggregates::default, |mut local, line| {
+            match parse_line(line, line_regex) {
+                Some(record) => local.record(record, rules),
+                None => local.parse_errors += 1,
+            }
+            local
+        })
+        .reduce(Aggregates::default, |mut a, b| {
+            a.merge(b);
+            a
+        })
 }
 
 fn flush_chunk(
@@ -155,21 +172,17 @@ pub fn parse_files_parallel(
         pb.set_message("processing lines");
     }
 
-    let partials: Vec<Result<Aggregates>> = files
+    files
         .par_iter()
         .map(|file| {
             let part = parse_file(file.as_path(), &line_regex, &rules, status_pb)?;
             files_pb.inc(1);
             Ok(part)
         })
-        .collect();
-
-    let mut acc = Aggregates::default();
-    for partial in partials {
-        acc.merge(partial?);
-    }
-
-    Ok(acc)
+        .try_reduce(Aggregates::default, |mut acc, partial| {
+            acc.merge(partial);
+            Ok(acc)
+        })
 }
 
 #[cfg(test)]
