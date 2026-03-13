@@ -10,7 +10,7 @@ pub mod tui;
 
 use cli::Args;
 use domain::{Dimension, GroupingRules};
-use parser::{build_line_regex, count_file_lines, parse_files_parallel};
+use parser::{build_line_regex, parse_files_parallel};
 use tui::{App, run_tui};
 
 pub fn run(args: Args) -> Result<()> {
@@ -28,33 +28,25 @@ pub fn run(args: Args) -> Result<()> {
         .progress_chars("=>-"),
     );
 
-    let status_pb = if args.files.len() == 1 {
-        let total_lines = count_file_lines(&args.files[0])?;
-        let status = multi.add(ProgressBar::new(total_lines));
-        status.set_style(
-            ProgressStyle::with_template(
-                "[{elapsed_precise}] [{bar:40.green/black}] {pos}/{len} lines  {msg}",
-            )
-            .unwrap()
-            .progress_chars("=>-"),
-        );
-        Some(status)
-    } else {
-        None
-    };
+    let status_pb = multi.add(ProgressBar::new(0));
+    status_pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:40.green/black}] {pos}/{len} lines  {msg}",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
 
     let aggregates = parse_files_parallel(
         &args.files,
         line_regex,
         rules,
         &files_pb,
-        status_pb.as_ref(),
+        Some(&status_pb),
     )?;
 
     files_pb.finish_and_clear();
-    if let Some(status) = status_pb {
-        status.finish_and_clear();
-    }
+    status_pb.finish_and_clear();
 
     let mut app = App {
         aggregates,

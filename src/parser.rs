@@ -5,7 +5,6 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
-use rayon::prelude::*;
 use regex::Regex;
 
 use crate::domain::{Aggregates, GroupingRules, ParsedRecord};
@@ -94,23 +93,22 @@ pub fn parse_files_parallel(
     files_pb: &ProgressBar,
     status_pb: Option<&ProgressBar>,
 ) -> Result<Aggregates> {
-    files
-        .par_iter()
-        .try_fold(Aggregates::default, |mut acc, file| {
-            if let Some(status_pb) = status_pb {
-                status_pb.set_message(format!("processing {}", file.display()));
-            }
+    let mut acc = Aggregates::default();
 
-            let part = parse_file(file.as_path(), &line_regex, &rules, status_pb)?;
+    for file in files {
+        if let Some(status_pb) = status_pb {
+            let total_lines = count_file_lines(file.as_path())?;
+            status_pb.set_length(total_lines);
+            status_pb.set_position(0);
+            status_pb.set_message(format!("processing {}", file.display()));
+        }
 
-            acc.merge(part);
-            files_pb.inc(1);
-            Ok(acc)
-        })
-        .try_reduce(Aggregates::default, |mut a, b| {
-            a.merge(b);
-            Ok(a)
-        })
+        let part = parse_file(file.as_path(), &line_regex, &rules, status_pb)?;
+        acc.merge(part);
+        files_pb.inc(1);
+    }
+
+    Ok(acc)
 }
 
 #[cfg(test)]
