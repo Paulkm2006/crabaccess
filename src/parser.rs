@@ -11,7 +11,7 @@ use crate::domain::{Aggregates, GroupingRules, ParsedRecord};
 
 pub fn build_line_regex() -> Result<Regex> {
     Regex::new(
-        r#"^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+\"(?P<request>[^\"]*)\"\s+(?P<status>\d{3})\s+(?P<bytes>\S+)\s+\"[^\"]*\"\s+\"(?P<ua>[^\"]*)\""#,
+        r#"^(?P<ip>\S+)\s+\S+\s+\S+\s+\[(?P<time>[^\]]+)\]\s+\"(?P<request>[^\"]*)\"\s+(?P<status>\d{3})\s+(?P<bytes>\S+)\s+\"[^\"]*\"\s+\"(?P<ua>[^\"]*)\""#,
     )
     .context("Failed to compile nginx access log regex")
 }
@@ -33,6 +33,8 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
         .name("bytes")
         .map_or(0, |m| m.as_str().parse::<u64>().unwrap_or(0));
 
+    let timestamp_str = captures.name("time").map(|m| m.as_str().to_owned());
+
     let path = request
         .split_whitespace()
         .nth(1)
@@ -44,6 +46,7 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
         user_agent,
         status_code,
         traffic_bytes,
+        timestamp_str,
     })
 }
 

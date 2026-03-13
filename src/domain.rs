@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::{Context, Result};
 use regex::Regex;
@@ -43,6 +43,32 @@ impl Dimension {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DateGranularity {
+    Hour,
+    #[default]
+    Day,
+    Month,
+}
+
+impl DateGranularity {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Hour => Self::Day,
+            Self::Day => Self::Month,
+            Self::Month => Self::Hour,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hour => "Hour",
+            Self::Day => "Day",
+            Self::Month => "Month",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Counter {
     pub visits: u64,
@@ -70,6 +96,9 @@ pub struct Aggregates {
     path: HashMap<String, Counter>,
     user_agent: HashMap<String, Counter>,
     status_code: HashMap<String, Counter>,
+    pub by_day: BTreeMap<String, Counter>,
+    pub by_hour: BTreeMap<String, Counter>,
+    pub by_month: BTreeMap<String, Counter>,
 }
 
 impl Aggregates {
@@ -81,6 +110,9 @@ impl Aggregates {
         merge_map(&mut self.path, other.path);
         merge_map(&mut self.user_agent, other.user_agent);
         merge_map(&mut self.status_code, other.status_code);
+        merge_btree(&mut self.by_day, other.by_day);
+        merge_btree(&mut self.by_hour, other.by_hour);
+        merge_btree(&mut self.by_month, other.by_month);
     }
 
     pub fn record(&mut self, record: ParsedRecord, rules: &GroupingRules) {
@@ -104,6 +136,23 @@ impl Aggregates {
             .entry(record.status_code)
             .or_default()
             .add_hit(record.traffic_bytes);
+
+        if let Some(ref ts) = record.timestamp_str {
+            if let Some((day_key, hour_key, month_key)) = parse_timestamp(ts) {
+                self.by_day.entry(day_key).or_default().add_hit(record.traffic_bytes);
+                self.by_hour.entry(hour_key).or_default().add_hit(record.traffic_bytes);
+                self.by_month.entry(month_key).or_default().add_hit(record.traffic_bytes);
+            }
+        }
+    }
+
+    pub fn date_series(&self, granularity: DateGranularity) -> Vec<(&str, Counter)> {
+        let map = match granularity {
+            DateGranularity::Hour => &self.by_hour,
+            DateGranularity::Day => &self.by_day,
+            DateGranularity::Month => &self.by_month,
+        };
+        map.iter().map(|(k, v)| (k.as_str(), *v)).collect()
     }
 
     pub fn selected_map(&self, dimension: Dimension) -> &HashMap<String, Counter> {
@@ -122,6 +171,34 @@ fn merge_map(target: &mut HashMap<String, Counter>, source: HashMap<String, Coun
     }
 }
 
+fn merge_btree(target: &mut BTreeMap<String, Counter>, source: BTreeMap<String, Counter>) {
+    for (key, value) in source {
+        target.entry(key).or_default().merge(value);
+    }
+}
+
+fn parse_timestamp(s: &str) -> Option<(String, String, String)> {
+    // Format: "13/Mar/2026:09:22:11 +0000"
+    if s.len() < 14 {
+        return None;
+    }
+    let day = s.get(0..2)?;
+    let mon_str = s.get(3..6)?;
+    let year = s.get(7..11)?;
+    let hour = s.get(12..14)?;
+    let mon_num = match mon_str {
+        "Jan" => "01", "Feb" => "02", "Mar" => "03", "Apr" => "04",
+        "May" => "05", "Jun" => "06", "Jul" => "07", "Aug" => "08",
+        "Sep" => "09", "Oct" => "10", "Nov" => "11", "Dec" => "12",
+        _ => return None,
+    };
+    Some((
+        format!("{}-{}-{}", year, mon_num, day),
+        format!("{}-{}-{} {}:00", year, mon_num, day, hour),
+        format!("{}-{}", year, mon_num),
+    ))
+}
+
 #[derive(Debug)]
 pub struct ParsedRecord {
     pub ip: String,
@@ -129,6 +206,7 @@ pub struct ParsedRecord {
     pub user_agent: String,
     pub status_code: String,
     pub traffic_bytes: u64,
+    pub timestamp_str: Option<String>,
 }
 
 #[derive(Clone)]
