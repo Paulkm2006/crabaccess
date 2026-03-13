@@ -1,10 +1,11 @@
 use std::fs::File;
-use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::str;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
+use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::Regex;
 
@@ -45,9 +46,8 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
 }
 
 const CHUNK_LINES: usize = 20_000;
-const READ_BUFFER_CAPACITY: usize = 1024 * 1024;
 
-fn parse_chunk(lines: &[String], line_regex: &Regex, rules: &GroupingRules) -> Aggregates {
+fn parse_chunk(lines: &[&str], line_regex: &Regex, rules: &GroupingRules) -> Aggregates {
     let mut aggregates = Aggregates::default();
 
     for line in lines {
@@ -60,6 +60,37 @@ fn parse_chunk(lines: &[String], line_regex: &Regex, rules: &GroupingRules) -> A
     aggregates
 }
 
+fn flush_chunk(
+    chunk: &mut Vec<&str>,
+    aggregate: &mut Aggregates,
+    line_regex: &Regex,
+    rules: &GroupingRules,
+    status_pb: Option<&ProgressBar>,
+) {
+    if chunk.is_empty() {
+        return;
+    }
+
+    let chunk_agg = parse_chunk(chunk, line_regex, rules);
+    aggregate.merge(chunk_agg);
+
+    if let Some(status_pb) = status_pb {
+        status_pb.inc(chunk.len() as u64);
+    }
+
+    chunk.clear();
+}
+
+fn parse_mapped_line<'a>(line_bytes: &'a [u8], path: &Path) -> Result<&'a str> {
+    let line_bytes = match line_bytes.last() {
+        Some(b'\r') => &line_bytes[..line_bytes.len() - 1],
+        _ => line_bytes,
+    };
+
+    str::from_utf8(line_bytes)
+        .with_context(|| format!("Unable to decode UTF-8 log line from: {}", path.display()))
+}
+
 fn parse_file(
     path: &Path,
     line_regex: &Regex,
@@ -68,33 +99,47 @@ fn parse_file(
 ) -> Result<Aggregates> {
     let file = File::open(path)
         .with_context(|| format!("Unable to open log file: {}", path.display()))?;
-    let reader = BufReader::with_capacity(READ_BUFFER_CAPACITY, file);
+
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("Unable to read metadata for: {}", path.display()))?
+        .len();
+
+    if file_len == 0 {
+        return Ok(Aggregates::default());
+    }
+
+    let mmap = unsafe {
+        Mmap::map(&file)
+    }
+    .with_context(|| format!("Unable to memory-map log file: {}", path.display()))?;
+    let bytes = &mmap[..];
 
     let mut chunk = Vec::with_capacity(CHUNK_LINES);
     let mut aggregate = Aggregates::default();
+    let mut line_start = 0;
 
-    for line_result in reader.lines() {
-        let line = line_result
-            .with_context(|| format!("Unable to read a line from: {}", path.display()))?;
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte != b'\n' {
+            continue;
+        }
+
+        let line = parse_mapped_line(&bytes[line_start..index], path)?;
         chunk.push(line);
 
         if chunk.len() == CHUNK_LINES {
-            let chunk_agg = parse_chunk(&chunk, line_regex, rules);
-            aggregate.merge(chunk_agg);
-            if let Some(status_pb) = status_pb {
-                status_pb.inc(chunk.len() as u64);
-            }
-            chunk.clear();
+            flush_chunk(&mut chunk, &mut aggregate, line_regex, rules, status_pb);
         }
+
+        line_start = index + 1;
     }
 
-    if !chunk.is_empty() {
-        let chunk_agg = parse_chunk(&chunk, line_regex, rules);
-        aggregate.merge(chunk_agg);
-        if let Some(status_pb) = status_pb {
-            status_pb.inc(chunk.len() as u64);
-        }
+    if line_start < bytes.len() {
+        let line = parse_mapped_line(&bytes[line_start..], path)?;
+        chunk.push(line);
     }
+
+    flush_chunk(&mut chunk, &mut aggregate, line_regex, rules, status_pb);
 
     Ok(aggregate)
 }
@@ -130,6 +175,40 @@ pub fn parse_files_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::cli::{Args, SortBy};
+    use crate::domain::GroupingRules;
+
+    fn make_temp_file(test_name: &str, contents: &[u8]) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("crabaccess-{test_name}-{unique}.log"));
+        fs::write(&path, contents).expect("temp log file should be written");
+        path
+    }
+
+    fn default_grouping_rules() -> GroupingRules {
+        GroupingRules::from_args(&Args {
+            files: Vec::new(),
+            load_db: None,
+            save_db: None,
+            export_csv: None,
+            top: 30,
+            graph_items: 0,
+            sort_by: SortBy::Visits,
+            group_ip_regex: "^(.*)$".to_owned(),
+            group_ip_replace: "$1".to_owned(),
+            group_path_regex: "^(.*)$".to_owned(),
+            group_path_replace: "$1".to_owned(),
+            group_ua_regex: "^(.*)$".to_owned(),
+            group_ua_replace: "$1".to_owned(),
+        })
+        .expect("default grouping rules should compile")
+    }
 
     #[test]
     fn parses_standard_nginx_line() {
@@ -140,5 +219,23 @@ mod tests {
         assert_eq!(rec.path, "/api/v1/users?id=1");
         assert_eq!(rec.user_agent, "curl/8.5");
         assert_eq!(rec.traffic_bytes, 532);
+    }
+
+    #[test]
+    fn parse_file_handles_crlf_and_trailing_newline_without_extra_error() {
+        let regex = build_line_regex().expect("regex should compile");
+        let rules = default_grouping_rules();
+        let log_path = make_temp_file(
+            "mmap-crlf",
+            b"127.0.0.1 - - [13/Mar/2026:09:22:11 +0000] \"GET /ok HTTP/1.1\" 200 10 \"-\" \"curl/8.5\"\r\n127.0.0.2 - - [13/Mar/2026:09:22:12 +0000] \"GET /next HTTP/1.1\" 404 20 \"-\" \"curl/8.5\"\r\n",
+        );
+
+        let aggregates = parse_file(log_path.as_path(), &regex, &rules, None)
+            .expect("mapped file should parse");
+
+        assert_eq!(aggregates.total_visits, 2);
+        assert_eq!(aggregates.parse_errors, 0);
+
+        fs::remove_file(log_path).expect("temp log file should be removed");
     }
 }
