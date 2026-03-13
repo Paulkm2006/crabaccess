@@ -10,11 +10,9 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols;
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 use ratatui::widgets::{
-    Axis, Bar, BarChart, Block, Borders, Cell, Chart, Dataset, GraphType, Paragraph, Row, Table,
-    Tabs,
+    Bar, BarChart, Block, Borders, Cell, Paragraph, Row, Table, Tabs,
 };
 
 use crate::cli::SortBy;
@@ -126,7 +124,7 @@ fn render_ui(frame: &mut ratatui::Frame<'_>, app: &mut App) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title("Tab/←/→ switch  s metric  g granularity  q quit"),
+                .title("Tab/←/→ switch  s sort  g granularity  q quit"),
         );
     frame.render_widget(tabs, areas[1]);
 
@@ -241,80 +239,67 @@ fn render_trend(frame: &mut ratatui::Frame<'_>, app: &App, area: Rect) {
         return;
     }
 
-    let n = series.len();
-
-    let data_visits: Vec<(f64, f64)> = series
-        .iter()
-        .enumerate()
-        .map(|(i, (_, c))| (i as f64, c.visits as f64))
-        .collect();
-    let data_traffic: Vec<(f64, f64)> = series
-        .iter()
-        .enumerate()
-        .map(|(i, (_, c))| (i as f64, c.traffic_bytes as f64))
-        .collect();
-
-    let (chart_data, metric_label): (&[(f64, f64)], &str) = match app.sort_by {
-        SortBy::Visits => (&data_visits, "Visits"),
-        SortBy::Traffic => (&data_traffic, "Traffic"),
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let visible_points = trend_chart_capacity(area.width);
+    let start = series.len().saturating_sub(visible_points);
+    let visible_series = &series[start..];
+    let title_suffix = if visible_series.len() < series.len() {
+        format!(
+            "{} (last {} of {})",
+            app.trend_granularity.label(),
+            visible_series.len(),
+            series.len()
+        )
+    } else {
+        app.trend_granularity.label().to_owned()
     };
 
-    let max_y = chart_data
+    let visit_bars: Vec<Bar<'static>> = visible_series
         .iter()
-        .map(|(_, y)| *y)
-        .fold(0.0_f64, f64::max)
-        .max(1.0);
-
-    // Pick up to 6 evenly-spaced x-axis labels.
-    let label_count = n.min(6);
-    let step = if label_count <= 1 { 1 } else { (n - 1) / (label_count - 1) };
-    let x_labels: Vec<Span<'static>> = (0..label_count)
-        .map(|i| {
-            let idx = (i * step).min(n - 1);
-            Span::raw(series[idx].0.to_owned())
+        .map(|(label, counter)| {
+            Bar::with_label(trend_label(label, app.trend_granularity), counter.visits)
+                .text_value(counter.visits.to_string())
+        })
+        .collect();
+    let traffic_bars: Vec<Bar<'static>> = visible_series
+        .iter()
+        .map(|(label, counter)| {
+            Bar::with_label(
+                trend_label(label, app.trend_granularity),
+                counter.traffic_bytes,
+            )
+            .text_value(format_bytes(counter.traffic_bytes))
         })
         .collect();
 
-    let y_labels: Vec<Span<'static>> = vec![
-        Span::raw("0"),
-        Span::raw(format_y_label(max_y * 0.5, app.sort_by)),
-        Span::raw(format_y_label(max_y, app.sort_by)),
-    ];
-
-    let dataset = Dataset::default()
-        .name(metric_label)
-        .data(chart_data)
-        .graph_type(GraphType::Line)
-        .marker(symbols::Marker::Braille)
-        .style(Style::default().fg(Color::Cyan));
-
-    let chart = Chart::new(vec![dataset])
+    let visits_chart = BarChart::new(visit_bars)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(
-                    "Trend by Date – {} – {}  [g=granularity  s=metric]",
-                    app.trend_granularity.label(),
-                    metric_label,
-                ))
-                .title_style(Style::default().fg(Color::White)),
+                .title(format!("Trend by Date - Visits - {}", title_suffix)),
         )
-        .x_axis(
-            Axis::default()
-                .title(app.trend_granularity.label())
-                .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, (n.saturating_sub(1)) as f64])
-                .labels(x_labels),
-        )
-        .y_axis(
-            Axis::default()
-                .title(metric_label)
-                .style(Style::default().fg(Color::Gray))
-                .bounds([0.0, max_y * 1.1])
-                .labels(y_labels),
-        );
+        .bar_width(10)
+        .bar_gap(1)
+        .value_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .label_style(Style::default().fg(Color::White))
+        .bar_style(Style::default().fg(Color::Cyan));
+    frame.render_widget(visits_chart, sections[0]);
 
-    frame.render_widget(chart, area);
+    let traffic_chart = BarChart::new(traffic_bars)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("Trend by Date - Traffic - {}", title_suffix)),
+        )
+        .bar_width(10)
+        .bar_gap(1)
+        .value_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        .label_style(Style::default().fg(Color::White))
+        .bar_style(Style::default().fg(Color::Green));
+    frame.render_widget(traffic_chart, sections[1]);
 }
 
 fn truncate_label(text: &str, max: usize) -> String {
@@ -334,6 +319,20 @@ fn chart_value_text(sort_by: SortBy, row: &MetricRow) -> String {
     }
 }
 
+fn trend_chart_capacity(width: u16) -> usize {
+    let inner_width = width.saturating_sub(2) as usize;
+    let capacity = inner_width / 11;
+    capacity.max(1)
+}
+
+fn trend_label(label: &str, granularity: DateGranularity) -> String {
+    match granularity {
+        DateGranularity::Hour => label.get(5..13).unwrap_or(label).to_owned(),
+        DateGranularity::Day => label.get(5..10).unwrap_or(label).to_owned(),
+        DateGranularity::Month => label.to_owned(),
+    }
+}
+
 fn format_bytes(value: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     let mut size = value as f64;
@@ -346,13 +345,6 @@ fn format_bytes(value: u64) -> String {
         format!("{} {}", value, UNITS[idx])
     } else {
         format!("{:.2} {}", size, UNITS[idx])
-    }
-}
-
-fn format_y_label(value: f64, sort_by: SortBy) -> String {
-    match sort_by {
-        SortBy::Visits => format!("{}", value as u64),
-        SortBy::Traffic => format_bytes(value as u64),
     }
 }
 
@@ -438,5 +430,20 @@ mod tests {
     fn chart_value_text_uses_human_readable_bytes_for_traffic_sort() {
         let row = metric_row(42, 3_145_728);
         assert_eq!(chart_value_text(SortBy::Traffic, &row), "3.00 MB");
+    }
+
+    #[test]
+    fn trend_label_shortens_hour_keys() {
+        assert_eq!(trend_label("2026-03-13 09", DateGranularity::Hour), "03-13 09");
+    }
+
+    #[test]
+    fn trend_label_shortens_day_keys() {
+        assert_eq!(trend_label("2026-03-13", DateGranularity::Day), "03-13");
+    }
+
+    #[test]
+    fn trend_chart_capacity_keeps_at_least_one_bar() {
+        assert_eq!(trend_chart_capacity(6), 1);
     }
 }
