@@ -11,6 +11,7 @@ pub enum Dimension {
     Ip,
     Path,
     UserAgent,
+    StatusCode,
 }
 
 impl Dimension {
@@ -19,6 +20,7 @@ impl Dimension {
             Self::Ip => "IP",
             Self::Path => "Path",
             Self::UserAgent => "User-Agent",
+            Self::StatusCode => "Status",
         }
     }
 
@@ -26,15 +28,17 @@ impl Dimension {
         match self {
             Self::Ip => Self::Path,
             Self::Path => Self::UserAgent,
-            Self::UserAgent => Self::Ip,
+            Self::UserAgent => Self::StatusCode,
+            Self::StatusCode => Self::Ip,
         }
     }
 
     pub fn previous(self) -> Self {
         match self {
-            Self::Ip => Self::UserAgent,
+            Self::Ip => Self::StatusCode,
             Self::Path => Self::Ip,
             Self::UserAgent => Self::Path,
+            Self::StatusCode => Self::UserAgent,
         }
     }
 }
@@ -65,6 +69,7 @@ pub struct Aggregates {
     ip: HashMap<String, Counter>,
     path: HashMap<String, Counter>,
     user_agent: HashMap<String, Counter>,
+    status_code: HashMap<String, Counter>,
 }
 
 impl Aggregates {
@@ -75,6 +80,7 @@ impl Aggregates {
         merge_map(&mut self.ip, other.ip);
         merge_map(&mut self.path, other.path);
         merge_map(&mut self.user_agent, other.user_agent);
+        merge_map(&mut self.status_code, other.status_code);
     }
 
     pub fn record(&mut self, record: ParsedRecord, rules: &GroupingRules) {
@@ -94,6 +100,10 @@ impl Aggregates {
             .entry(grouped_ua)
             .or_default()
             .add_hit(record.traffic_bytes);
+        self.status_code
+            .entry(record.status_code)
+            .or_default()
+            .add_hit(record.traffic_bytes);
     }
 
     pub fn selected_map(&self, dimension: Dimension) -> &HashMap<String, Counter> {
@@ -101,6 +111,7 @@ impl Aggregates {
             Dimension::Ip => &self.ip,
             Dimension::Path => &self.path,
             Dimension::UserAgent => &self.user_agent,
+            Dimension::StatusCode => &self.status_code,
         }
     }
 }
@@ -116,6 +127,7 @@ pub struct ParsedRecord {
     pub ip: String,
     pub path: String,
     pub user_agent: String,
+    pub status_code: String,
     pub traffic_bytes: u64,
 }
 

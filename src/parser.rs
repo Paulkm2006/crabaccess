@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use indicatif::ProgressBar;
 use rayon::prelude::*;
 use regex::Regex;
 
@@ -11,7 +12,7 @@ use crate::domain::{Aggregates, GroupingRules, ParsedRecord};
 
 pub fn build_line_regex() -> Result<Regex> {
     Regex::new(
-        r#"^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+\"(?P<request>[^\"]*)\"\s+\d{3}\s+(?P<bytes>\S+)\s+\"[^\"]*\"\s+\"(?P<ua>[^\"]*)\""#,
+        r#"^(?P<ip>\S+)\s+\S+\s+\S+\s+\[[^\]]+\]\s+\"(?P<request>[^\"]*)\"\s+(?P<status>\d{3})\s+(?P<bytes>\S+)\s+\"[^\"]*\"\s+\"(?P<ua>[^\"]*)\""#,
     )
     .context("Failed to compile nginx access log regex")
 }
@@ -23,6 +24,10 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
     let request = captures.name("request")?.as_str();
     let user_agent = captures
         .name("ua")
+        .map_or("-", |m| m.as_str())
+        .to_owned();
+    let status_code = captures
+        .name("status")
         .map_or("-", |m| m.as_str())
         .to_owned();
     let traffic_bytes = captures
@@ -38,6 +43,7 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
         ip,
         path,
         user_agent,
+        status_code,
         traffic_bytes,
     })
 }
@@ -64,12 +70,14 @@ pub fn parse_files_parallel(
     files: &[PathBuf],
     line_regex: Arc<Regex>,
     rules: Arc<GroupingRules>,
+    pb: &ProgressBar,
 ) -> Result<Aggregates> {
     files
         .par_iter()
         .try_fold(Aggregates::default, |mut acc, file| {
             let part = parse_file(file.as_path(), &line_regex, &rules)?;
             acc.merge(part);
+            pb.inc(1);
             Ok(acc)
         })
         .try_reduce(Aggregates::default, |mut a, b| {

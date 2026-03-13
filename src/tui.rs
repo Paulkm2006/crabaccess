@@ -71,11 +71,12 @@ fn render_ui(frame: &mut ratatui::Frame<'_>, app: &App) {
     .block(Block::default().borders(Borders::ALL).title("Summary"));
     frame.render_widget(summary, areas[0]);
 
-    let titles = ["IP", "Path", "User-Agent"];
+    let titles = ["IP", "Path", "User-Agent", "Status"];
     let selected = match app.dimension {
         Dimension::Ip => 0,
         Dimension::Path => 1,
         Dimension::UserAgent => 2,
+        Dimension::StatusCode => 3,
     };
     let tabs = Tabs::new(titles)
         .select(selected)

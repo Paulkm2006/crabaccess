@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use indicatif::{ProgressBar, ProgressStyle};
 
 pub mod cli;
 pub mod domain;
@@ -16,7 +17,17 @@ pub fn run(args: Args) -> Result<()> {
     let rules = Arc::new(GroupingRules::from_args(&args)?);
     let line_regex = Arc::new(build_line_regex()?);
 
-    let aggregates = parse_files_parallel(&args.files, line_regex, rules)?;
+    let pb = ProgressBar::new(args.files.len() as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files",
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+
+    let aggregates = parse_files_parallel(&args.files, line_regex, rules, &pb)?;
+    pb.finish_and_clear();
 
     let mut app = App {
         aggregates,
