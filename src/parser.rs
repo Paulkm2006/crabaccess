@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
+use rayon::prelude::*;
 use regex::Regex;
 
 use crate::domain::{Aggregates, GroupingRules, ParsedRecord};
@@ -50,6 +51,21 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
     })
 }
 
+const CHUNK_LINES: usize = 20_000;
+
+fn parse_chunk(lines: &[String], line_regex: &Regex, rules: &GroupingRules) -> Aggregates {
+    let mut aggregates = Aggregates::default();
+
+    for line in lines {
+        match parse_line(line, line_regex) {
+            Some(record) => aggregates.record(record, rules),
+            None => aggregates.parse_errors += 1,
+        }
+    }
+
+    aggregates
+}
+
 fn parse_file(
     path: &Path,
     line_regex: &Regex,
@@ -59,19 +75,25 @@ fn parse_file(
     let file = File::open(path)
         .with_context(|| format!("Unable to open log file: {}", path.display()))?;
     let reader = BufReader::new(file);
-    let mut aggregates = Aggregates::default();
+    let mut lines = Vec::new();
 
     for line_result in reader.lines() {
         let line = line_result
             .with_context(|| format!("Unable to read a line from: {}", path.display()))?;
-        match parse_line(&line, line_regex) {
-            Some(record) => aggregates.record(record, rules),
-            None => aggregates.parse_errors += 1,
-        }
-        if let Some(status_pb) = status_pb {
-            status_pb.inc(1);
-        }
+        lines.push(line);
     }
+
+    if let Some(status_pb) = status_pb {
+        status_pb.inc(lines.len() as u64);
+    }
+
+    let aggregates = lines
+        .par_chunks(CHUNK_LINES)
+        .map(|chunk| parse_chunk(chunk, line_regex, rules))
+        .reduce(Aggregates::default, |mut acc, chunk_agg| {
+            acc.merge(chunk_agg);
+            acc
+        });
 
     Ok(aggregates)
 }
@@ -96,19 +118,29 @@ pub fn parse_files_parallel(
     files_pb: &ProgressBar,
     status_pb: Option<&ProgressBar>,
 ) -> Result<Aggregates> {
+    // Pre-count lines across all files so both bars are fully initialised before parsing starts.
+    if let Some(pb) = status_pb {
+        pb.set_message("counting lines…");
+        let total: u64 = files
+            .par_iter()
+            .map(|f| count_file_lines(f.as_path()).unwrap_or(0))
+            .sum();
+        pb.set_length(total);
+        pb.set_message("processing in parallel");
+    }
+
+    let partials: Vec<Result<Aggregates>> = files
+        .par_iter()
+        .map(|file| {
+            let part = parse_file(file.as_path(), &line_regex, &rules, status_pb)?;
+            files_pb.inc(1);
+            Ok(part)
+        })
+        .collect();
+
     let mut acc = Aggregates::default();
-
-    for file in files {
-        if let Some(status_pb) = status_pb {
-            let total_lines = count_file_lines(file.as_path())?;
-            status_pb.set_length(total_lines);
-            status_pb.set_position(0);
-            status_pb.set_message(format!("processing {}", file.display()));
-        }
-
-        let part = parse_file(file.as_path(), &line_regex, &rules, status_pb)?;
-        acc.merge(part);
-        files_pb.inc(1);
+    for partial in partials {
+        acc.merge(partial?);
     }
 
     Ok(acc)
