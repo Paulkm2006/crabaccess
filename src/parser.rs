@@ -48,7 +48,12 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
     })
 }
 
-fn parse_file(path: &Path, line_regex: &Regex, rules: &GroupingRules) -> Result<Aggregates> {
+fn parse_file(
+    path: &Path,
+    line_regex: &Regex,
+    rules: &GroupingRules,
+    status_pb: Option<&ProgressBar>,
+) -> Result<Aggregates> {
     let file = File::open(path)
         .with_context(|| format!("Unable to open log file: {}", path.display()))?;
     let reader = BufReader::new(file);
@@ -61,23 +66,45 @@ fn parse_file(path: &Path, line_regex: &Regex, rules: &GroupingRules) -> Result<
             Some(record) => aggregates.record(record, rules),
             None => aggregates.parse_errors += 1,
         }
+        if let Some(status_pb) = status_pb {
+            status_pb.inc(1);
+        }
     }
 
     Ok(aggregates)
+}
+
+pub fn count_file_lines(path: &Path) -> Result<u64> {
+    let file = File::open(path)
+        .with_context(|| format!("Unable to open log file for line counting: {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut count = 0u64;
+    for line_result in reader.lines() {
+        line_result
+            .with_context(|| format!("Unable to read a line from: {}", path.display()))?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
 }
 
 pub fn parse_files_parallel(
     files: &[PathBuf],
     line_regex: Arc<Regex>,
     rules: Arc<GroupingRules>,
-    pb: &ProgressBar,
+    files_pb: &ProgressBar,
+    status_pb: Option<&ProgressBar>,
 ) -> Result<Aggregates> {
     files
         .par_iter()
         .try_fold(Aggregates::default, |mut acc, file| {
-            let part = parse_file(file.as_path(), &line_regex, &rules)?;
+            if let Some(status_pb) = status_pb {
+                status_pb.set_message(format!("processing {}", file.display()));
+            }
+
+            let part = parse_file(file.as_path(), &line_regex, &rules, status_pb)?;
+
             acc.merge(part);
-            pb.inc(1);
+            files_pb.inc(1);
             Ok(acc)
         })
         .try_reduce(Aggregates::default, |mut a, b| {
