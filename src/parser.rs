@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use indicatif::ProgressBar;
+use memchr::memchr_iter;
 use memmap2::Mmap;
 use rayon::prelude::*;
 use regex::Regex;
@@ -19,6 +20,14 @@ pub fn build_line_regex() -> Result<Regex> {
 }
 
 pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
+    if let Some(record) = parse_line_delimited(line) {
+        return Some(record);
+    }
+
+    parse_line_with_regex(line, line_regex)
+}
+
+fn parse_line_with_regex(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
     let captures = line_regex.captures(line)?;
 
     let ip = captures.get(1)?.as_str().to_owned();
@@ -45,11 +54,63 @@ pub fn parse_line(line: &str, line_regex: &Regex) -> Option<ParsedRecord> {
     })
 }
 
+fn parse_line_delimited(line: &str) -> Option<ParsedRecord> {
+    // Expected nginx combined log format:
+    // ip - - [timestamp] "request" status bytes "referer" "user-agent"
+    let line = line.trim_end_matches('\r');
+    let ip_end = line.find(' ')?;
+    let ip = line.get(..ip_end)?.to_owned();
+    let mut cursor = ip_end;
+
+    let ts_open_rel = line.get(cursor..)?.find('[')?;
+    cursor += ts_open_rel + 1;
+    let ts_close_rel = line.get(cursor..)?.find(']')?;
+    let timestamp_str = Some(line.get(cursor..cursor + ts_close_rel)?.to_owned());
+    cursor += ts_close_rel + 1;
+
+    let req_open_rel = line.get(cursor..)?.find('"')?;
+    cursor += req_open_rel + 1;
+    let req_close_rel = line.get(cursor..)?.find('"')?;
+    let request = line.get(cursor..cursor + req_close_rel)?;
+    cursor += req_close_rel + 1;
+
+    let rest = line.get(cursor..)?.trim_start();
+    let mut rest_parts = rest.splitn(3, ' ');
+    let status_code = rest_parts.next()?.to_owned();
+    let traffic_bytes = rest_parts.next()?.parse::<u64>().unwrap_or(0);
+    let quoted_tail = rest_parts.next()?;
+
+    let mut quoted_fields = quoted_tail.split('"');
+    let _before_ref = quoted_fields.next()?;
+    let _referer = quoted_fields.next()?;
+    let _between_ref_and_ua = quoted_fields.next()?;
+    let user_agent = quoted_fields.next().unwrap_or("-").to_owned();
+
+    let path = request
+        .split_whitespace()
+        .nth(1)
+        .map_or_else(|| "-".to_owned(), std::borrow::ToOwned::to_owned);
+
+    Some(ParsedRecord {
+        ip,
+        path,
+        user_agent,
+        status_code,
+        traffic_bytes,
+        timestamp_str,
+    })
+}
+
 const CHUNK_LINES: usize = 20_000;
 const PARALLEL_CHUNK_MIN_LINES: usize = 4_096;
 
-fn parse_chunk(lines: &[&str], line_regex: &Regex, rules: &GroupingRules) -> Aggregates {
-    if lines.len() < PARALLEL_CHUNK_MIN_LINES {
+fn parse_chunk(
+    lines: &[&str],
+    line_regex: &Regex,
+    rules: &GroupingRules,
+    enable_line_parallelism: bool,
+) -> Aggregates {
+    if !enable_line_parallelism || lines.len() < PARALLEL_CHUNK_MIN_LINES {
         let mut aggregates = Aggregates::default();
 
         for line in lines {
@@ -82,13 +143,14 @@ fn flush_chunk(
     aggregate: &mut Aggregates,
     line_regex: &Regex,
     rules: &GroupingRules,
+    enable_line_parallelism: bool,
     status_pb: Option<&ProgressBar>,
 ) {
     if chunk.is_empty() {
         return;
     }
 
-    let chunk_agg = parse_chunk(chunk, line_regex, rules);
+    let chunk_agg = parse_chunk(chunk, line_regex, rules, enable_line_parallelism);
     aggregate.merge(chunk_agg);
 
     if let Some(status_pb) = status_pb {
@@ -112,6 +174,7 @@ fn parse_file(
     path: &Path,
     line_regex: &Regex,
     rules: &GroupingRules,
+    enable_line_parallelism: bool,
     status_pb: Option<&ProgressBar>,
 ) -> Result<Aggregates> {
     let file = File::open(path)
@@ -136,16 +199,19 @@ fn parse_file(
     let mut aggregate = Aggregates::default();
     let mut line_start = 0;
 
-    for (index, byte) in bytes.iter().enumerate() {
-        if *byte != b'\n' {
-            continue;
-        }
-
+    for index in memchr_iter(b'\n', bytes) {
         let line = parse_mapped_line(&bytes[line_start..index], path)?;
         chunk.push(line);
 
         if chunk.len() == CHUNK_LINES {
-            flush_chunk(&mut chunk, &mut aggregate, line_regex, rules, status_pb);
+            flush_chunk(
+                &mut chunk,
+                &mut aggregate,
+                line_regex,
+                rules,
+                enable_line_parallelism,
+                status_pb,
+            );
         }
 
         line_start = index + 1;
@@ -156,7 +222,14 @@ fn parse_file(
         chunk.push(line);
     }
 
-    flush_chunk(&mut chunk, &mut aggregate, line_regex, rules, status_pb);
+    flush_chunk(
+        &mut chunk,
+        &mut aggregate,
+        line_regex,
+        rules,
+        enable_line_parallelism,
+        status_pb,
+    );
 
     Ok(aggregate)
 }
@@ -168,14 +241,26 @@ pub fn parse_files_parallel(
     files_pb: &ProgressBar,
     status_pb: Option<&ProgressBar>,
 ) -> Result<Aggregates> {
+    let enable_line_parallelism = files.len() <= 1;
+
     if let Some(pb) = status_pb {
-        pb.set_message("processing lines");
+        if enable_line_parallelism {
+            pb.set_message("processing lines (single file mode)");
+        } else {
+            pb.set_message("processing lines (multi-file mode)");
+        }
     }
 
     files
         .par_iter()
         .map(|file| {
-            let part = parse_file(file.as_path(), &line_regex, &rules, status_pb)?;
+            let part = parse_file(
+                file.as_path(),
+                &line_regex,
+                &rules,
+                enable_line_parallelism,
+                status_pb,
+            )?;
             files_pb.inc(1);
             Ok(part)
         })
@@ -243,12 +328,27 @@ mod tests {
             b"127.0.0.1 - - [13/Mar/2026:09:22:11 +0000] \"GET /ok HTTP/1.1\" 200 10 \"-\" \"curl/8.5\"\r\n127.0.0.2 - - [13/Mar/2026:09:22:12 +0000] \"GET /next HTTP/1.1\" 404 20 \"-\" \"curl/8.5\"\r\n",
         );
 
-        let aggregates = parse_file(log_path.as_path(), &regex, &rules, None)
+        let aggregates = parse_file(log_path.as_path(), &regex, &rules, true, None)
             .expect("mapped file should parse");
 
         assert_eq!(aggregates.total_visits, 2);
         assert_eq!(aggregates.parse_errors, 0);
 
         fs::remove_file(log_path).expect("temp log file should be removed");
+    }
+
+    #[test]
+    fn parse_line_delimited_parser_handles_standard_nginx_line() {
+        let regex = build_line_regex().expect("regex should compile");
+        let line = "127.0.0.1 - - [13/Mar/2026:09:22:11 +0000] \"GET /health HTTP/1.1\" 204 0 \"-\" \"curl/8.5\"";
+
+        let rec = parse_line(line, &regex).expect("line should parse");
+
+        assert_eq!(rec.ip, "127.0.0.1");
+        assert_eq!(rec.timestamp_str.as_deref(), Some("13/Mar/2026:09:22:11 +0000"));
+        assert_eq!(rec.path, "/health");
+        assert_eq!(rec.status_code, "204");
+        assert_eq!(rec.traffic_bytes, 0);
+        assert_eq!(rec.user_agent, "curl/8.5");
     }
 }
