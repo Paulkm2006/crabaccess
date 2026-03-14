@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::{BufReader, BufWriter};
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -13,23 +14,31 @@ struct PersistedData {
     aggregates: Aggregates,
 }
 
+#[derive(Serialize)]
+struct PersistedDataRef<'a> {
+    files_count: usize,
+    aggregates: &'a Aggregates,
+}
+
 pub fn save_database(path: &Path, aggregates: &Aggregates, files_count: usize) -> Result<()> {
     let file = File::create(path)
         .with_context(|| format!("Unable to create database file: {}", path.display()))?;
+    let writer = BufWriter::new(file);
 
-    let payload = PersistedData {
+    let payload = PersistedDataRef {
         files_count,
-        aggregates: clone_aggregates(aggregates),
+        aggregates,
     };
 
-    serde_json::to_writer_pretty(file, &payload)
+    serde_json::to_writer(writer, &payload)
         .with_context(|| format!("Unable to write database file: {}", path.display()))
 }
 
 pub fn load_database(path: &Path) -> Result<(Aggregates, usize)> {
     let file = File::open(path)
         .with_context(|| format!("Unable to open database file: {}", path.display()))?;
-    let payload: PersistedData = serde_json::from_reader(file)
+    let reader = BufReader::new(file);
+    let payload: PersistedData = serde_json::from_reader(reader)
         .with_context(|| format!("Unable to parse database file: {}", path.display()))?;
     Ok((payload.aggregates, payload.files_count))
 }
@@ -80,11 +89,6 @@ fn write_trend_rows(
         ])?;
     }
     Ok(())
-}
-
-fn clone_aggregates(aggregates: &Aggregates) -> Aggregates {
-    let payload = serde_json::to_vec(aggregates).expect("aggregates serialization should succeed");
-    serde_json::from_slice(&payload).expect("aggregates deserialization should succeed")
 }
 
 #[cfg(test)]

@@ -14,7 +14,9 @@ use ratatui::text::Line;
 use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
 use crate::cli::SortBy;
-use crate::domain::{Aggregates, DateGranularity, Dimension, MetricRow, compare_rows, pct};
+use crate::domain::{
+    Aggregates, DateGranularity, Dimension, MetricRow, top_rows_for_dimension,
+};
 
 mod dimension;
 mod trend;
@@ -74,22 +76,7 @@ impl App {
             AppTab::Dimension(d) => d,
             AppTab::Trend => return vec![],
         };
-        let mut rows: Vec<MetricRow> = self
-            .aggregates
-            .selected_map(dimension)
-            .iter()
-            .map(|(key, value)| MetricRow {
-                key: key.clone(),
-                visits: value.visits,
-                traffic_bytes: value.traffic_bytes,
-                visit_pct: pct(value.visits, self.aggregates.total_visits),
-                traffic_pct: pct(value.traffic_bytes, self.aggregates.total_traffic_bytes),
-            })
-            .collect();
-
-        rows.sort_by(|a, b| compare_rows(a, b, self.sort_by));
-        rows.truncate(self.top);
-        rows
+        top_rows_for_dimension(&self.aggregates, dimension, self.sort_by, self.top)
     }
 }
 

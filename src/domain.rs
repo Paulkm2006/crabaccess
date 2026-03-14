@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
+use gxhash::HashMap;
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -301,6 +302,82 @@ pub fn compare_rows(a: &MetricRow, b: &MetricRow, sort_by: SortBy) -> Ordering {
     }
 }
 
+fn compare_row_values(
+    a_key: &str,
+    a_visits: u64,
+    a_traffic: u64,
+    b_key: &str,
+    b_visits: u64,
+    b_traffic: u64,
+    sort_by: SortBy,
+) -> Ordering {
+    let primary = match sort_by {
+        SortBy::Visits => b_visits.cmp(&a_visits),
+        SortBy::Traffic => b_traffic.cmp(&a_traffic),
+    };
+    if primary == Ordering::Equal {
+        b_visits.cmp(&a_visits).then_with(|| a_key.cmp(b_key))
+    } else {
+        primary
+    }
+}
+
+pub fn top_rows_for_dimension(
+    aggregates: &Aggregates,
+    dimension: Dimension,
+    sort_by: SortBy,
+    top: usize,
+) -> Vec<MetricRow> {
+    if top == 0 {
+        return Vec::new();
+    }
+
+    let selected = aggregates.selected_map(dimension);
+    let mut top_rows: Vec<(&str, u64, u64)> = Vec::with_capacity(top.min(selected.len()));
+
+    for (key, counter) in selected {
+        if top_rows.len() < top {
+            top_rows.push((key.as_str(), counter.visits, counter.traffic_bytes));
+            continue;
+        }
+
+        let (worst_index, worst_row) = top_rows
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                compare_row_values(a.0, a.1, a.2, b.0, b.1, b.2, sort_by)
+            })
+            .expect("top rows should contain at least one element");
+
+        let candidate_cmp = compare_row_values(
+            key,
+            counter.visits,
+            counter.traffic_bytes,
+            worst_row.0,
+            worst_row.1,
+            worst_row.2,
+            sort_by,
+        );
+
+        if candidate_cmp == Ordering::Less {
+            top_rows[worst_index] = (key.as_str(), counter.visits, counter.traffic_bytes);
+        }
+    }
+
+    top_rows.sort_unstable_by(|a, b| compare_row_values(a.0, a.1, a.2, b.0, b.1, b.2, sort_by));
+
+    top_rows
+        .into_iter()
+        .map(|(key, visits, traffic_bytes)| MetricRow {
+            key: key.to_owned(),
+            visits,
+            traffic_bytes,
+            visit_pct: pct(visits, aggregates.total_visits),
+            traffic_pct: pct(traffic_bytes, aggregates.total_traffic_bytes),
+        })
+        .collect()
+}
+
 pub fn pct(value: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
@@ -321,5 +398,52 @@ mod tests {
         );
         let grouped = rule.apply("/products/list?page=2");
         assert_eq!(grouped, "/products");
+    }
+
+    #[test]
+    fn top_rows_for_dimension_returns_best_rows_without_full_sort() {
+        let mut aggregates = Aggregates {
+            total_visits: 30,
+            total_traffic_bytes: 600,
+            ..Default::default()
+        };
+        aggregates.ip.insert(
+            "a".to_owned(),
+            Counter {
+                visits: 10,
+                traffic_bytes: 100,
+            },
+        );
+        aggregates.ip.insert(
+            "b".to_owned(),
+            Counter {
+                visits: 5,
+                traffic_bytes: 300,
+            },
+        );
+        aggregates.ip.insert(
+            "c".to_owned(),
+            Counter {
+                visits: 8,
+                traffic_bytes: 50,
+            },
+        );
+        aggregates.ip.insert(
+            "d".to_owned(),
+            Counter {
+                visits: 7,
+                traffic_bytes: 200,
+            },
+        );
+
+        let by_visits = top_rows_for_dimension(&aggregates, Dimension::Ip, SortBy::Visits, 2);
+        assert_eq!(by_visits.len(), 2);
+        assert_eq!(by_visits[0].key, "a");
+        assert_eq!(by_visits[1].key, "c");
+
+        let by_traffic = top_rows_for_dimension(&aggregates, Dimension::Ip, SortBy::Traffic, 2);
+        assert_eq!(by_traffic.len(), 2);
+        assert_eq!(by_traffic[0].key, "b");
+        assert_eq!(by_traffic[1].key, "d");
     }
 }
