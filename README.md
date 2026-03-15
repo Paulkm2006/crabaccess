@@ -11,19 +11,20 @@ A high-performance Nginx access log analyzer with TUI visualization.
 - **Database Support**: Save and load parsed results for fast re-analysis
 - **CSV Export**: Export aggregated data for external analysis
 - **Flexible Grouping**: Use regex to group IPs, paths, or user agents
+- **Fast HashMap**: Use GxHash to store data maps.
 
 ## Installation
 
 ```bash
 git clone https://github.com/Paulkm2006/crabaccess.git
 cd crabaccess
-cargo install --path .
+RUSTFLAGS="-C target-cpu=native" cargo install --path .
 ```
 
 Or build from source:
 
 ```bash
-cargo build --release
+RUSTFLAGS="-C target-cpu=native" cargo build --release
 ```
 
 ## Usage
